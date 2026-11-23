@@ -1,0 +1,5 @@
+LIBRARY erc_plus
+EXPORTS
+    pluginit
+    plugstop
+    plugsetup
