@@ -110,6 +110,13 @@ static const std::unordered_map<std::string, std::vector<uint8_t>> INSN_MAP = {
 static std::string g_lastPattern;
 static int         g_lastPatternSize = 0;
 
+// ─── wildcard-aware pattern byte ────────────────────────────────────────────
+// wildcard=true means "match any byte at this position" (like ?? in OllyDbg)
+struct PatternByte {
+    uint8_t value    = 0;
+    bool    wildcard = false;
+};
+
 // ─── Genera un patrón cíclico único (estilo Metasploit/ERC) ─────────────────
 static std::string generatePattern(int size) {
     const char sets[3][40] = {
@@ -334,25 +341,43 @@ static std::string getPagePermissions(duint address) {
     return perms;
 }
 
-// ─── resolve pattern: single mnemonic, gadget, or hex ───────────────────────
-static bool resolvePattern(const std::string& raw, std::vector<uint8_t>& out) {
+// ─── resolve pattern: single mnemonic, gadget, or hex (wildcard-aware) ──────
+//
+// Wildcards:
+//   In hex mode  → "??" token matches any single byte:
+//                   "FF ?? C3"  →  [{FF,exact}, {00,wild}, {C3,exact}]
+//   In gadget mode → "pop ?" or "pop *" matches any single pop-reg byte (0x58-0x5F):
+//                   "pop ?; pop ?; ret"  →  [{wild}, {wild}, {C3,exact}]
+//
+static bool resolvePattern(const std::string& raw, std::vector<PatternByte>& out) {
     std::string lo = toLower(raw);
 
-    // 1) Direct single-mnemonic match
-    auto it = INSN_MAP.find(lo);
-    if (it != INSN_MAP.end()) {
-        out = it->second;
-        return true;
+    // Helper: append an exact byte
+    auto pushExact = [&](uint8_t b) {
+        out.push_back({b, false});
+    };
+    // Helper: append a wildcard byte
+    auto pushWild = [&]() {
+        out.push_back({0x00, true});
+    };
+
+    // 1) Direct single-mnemonic match (no wildcards possible here)
+    {
+        auto it = INSN_MAP.find(lo);
+        if (it != INSN_MAP.end()) {
+            for (uint8_t b : it->second) pushExact(b);
+            return true;
+        }
     }
 
-    // 2) Multi-instruction gadget: "push esp; ret" or "push esp + ret"
-    //    Both ';' and '+' act as separators. Whitespace around parts is trimmed.
+    // 2) Multi-instruction gadget: "pop ?; pop ?; ret" / "push esp; ret" / "push esp + ret"
+    //    Separators: ';' or '+'.  "pop ?" and "pop *" act as single-byte wildcards.
     {
         std::string s = raw;
         std::replace(s.begin(), s.end(), '+', ';');
 
         if (s.find(';') != std::string::npos) {
-            std::vector<uint8_t> combined;
+            std::vector<PatternByte> combined;
             bool ok = true;
             std::istringstream iss(s);
             std::string part;
@@ -361,11 +386,18 @@ static bool resolvePattern(const std::string& raw, std::vector<uint8_t>& out) {
                 size_t b = part.find_last_not_of(" \t");
                 if (a == std::string::npos) continue;   // skip empty segment
                 part = part.substr(a, b - a + 1);
+                std::string partLo = toLower(part);
 
-                auto pit = INSN_MAP.find(toLower(part));
+                // "pop ?" / "pop *"  →  wildcard byte (pop reg = 1 byte, 0x58-0x5F)
+                if (partLo == "pop ?" || partLo == "pop *") {
+                    combined.push_back({0x00, true});
+                    continue;
+                }
+
+                auto pit = INSN_MAP.find(partLo);
                 if (pit == INSN_MAP.end()) { ok = false; break; }
-                combined.insert(combined.end(),
-                                pit->second.begin(), pit->second.end());
+                for (uint8_t byte : pit->second)
+                    combined.push_back({byte, false});
             }
             if (ok && !combined.empty()) {
                 out = combined;
@@ -374,12 +406,61 @@ static bool resolvePattern(const std::string& raw, std::vector<uint8_t>& out) {
         }
     }
 
-    // 3) Hex fallback (0x / \x prefixes, spaces, and bare hex all accepted)
-    if (hexToBytes(raw, out)) return true;
+    // 3) Hex fallback with ?? wildcard support:
+    //    Tokens separated by whitespace; each token is either two hex digits or "??"
+    {
+        // Only enter hex mode if the string looks like hex/wildcard tokens,
+        // i.e. every non-space token is two hex chars OR "??"
+        std::istringstream iss(raw);
+        std::string token;
+        std::vector<PatternByte> hexOut;
+        bool looksHex = false;
+        bool valid    = true;
+
+        while (iss >> token) {
+            looksHex = true;   // at least one token found
+
+            // Strip a leading 0x or \x on a token if present
+            if (token.size() >= 2 && token[0] == '\\' &&
+                (token[1] == 'x' || token[1] == 'X'))
+                token = token.substr(2);
+            else if (token.size() >= 2 && token[0] == '0' &&
+                     (token[1] == 'x' || token[1] == 'X'))
+                token = token.substr(2);
+
+            if (token == "??" || token == "?") {
+                hexOut.push_back({0x00, true});
+            } else if (token.size() == 2 &&
+                       isxdigit((unsigned char)token[0]) &&
+                       isxdigit((unsigned char)token[1])) {
+                uint8_t b = (uint8_t)std::stoul(token, nullptr, 16);
+                hexOut.push_back({b, false});
+            } else {
+                // Not a valid two-char hex or wildcard → not hex mode
+                valid = false;
+                break;
+            }
+        }
+
+        if (looksHex && valid && !hexOut.empty()) {
+            out = hexOut;
+            return true;
+        }
+    }
+
+    // 4) Bare hex string (no spaces): "FFE4C3" or "\xFF\xE4\xC3" etc.
+    //    No wildcard support in this form (no spaces to separate tokens).
+    {
+        std::vector<uint8_t> raw8;
+        if (hexToBytes(raw, raw8)) {
+            for (uint8_t b : raw8) pushExact(b);
+            return true;
+        }
+    }
 
     logErr("Unknown pattern '" + raw + "'. "
-           "Use hex (FF E4), a mnemonic (jmp esp), "
-           "or a gadget ('push esp; ret').");
+           "Use hex (FF E4 | FF ?? C3), a mnemonic (jmp esp), "
+           "or a gadget ('pop ?; pop ?; ret').");
     return false;
 }
 
@@ -441,16 +522,25 @@ static ModuleFlags getModuleFlags(const std::string& modPath) {
     return f;
 }
 
+
+
 // ─── search bytes in a memory buffer ────────────────────────────────────────
 static std::vector<duint> searchInBuffer(
     const uint8_t* buf, size_t bufLen, duint baseAddr,
-    const std::vector<uint8_t>& pattern)
+    const std::vector<PatternByte>& pattern)
 {
     std::vector<duint> hits;
     if (pattern.empty() || bufLen < pattern.size()) return hits;
 
     for (size_t i = 0; i <= bufLen - pattern.size(); ++i) {
-        if (memcmp(buf + i, pattern.data(), pattern.size()) == 0)
+        bool match = true;
+        for (size_t j = 0; j < pattern.size(); ++j) {
+            if (!pattern[j].wildcard && buf[i + j] != pattern[j].value) {
+                match = false;
+                break;
+            }
+        }
+        if (match)
             hits.push_back(baseAddr + (duint)i);
     }
     return hits;
@@ -516,11 +606,11 @@ static void printHelp() {
         "    Same as SearchMemory but restricted to specific modules.\n"
         "    <list> is a comma-separated module list, e.g. \"kernel32.dll,user32.dll\"\n\n"
 
-        "  erc++ --Pattern, c, <length>\n"
+        "  erc++ -Pattern, c, <length>\n"
         "    Genera un patrón cíclico único (ASCII + hex \\x..).\n"
         "    Guarda el patrón para el comando 'o'.\n\n"
 
-        "  erc++ --Pattern, o, <valor>\n"
+        "  erc++ -Pattern, o, <valor>\n"
         "    Busca <valor> en el último patrón generado y muestra su offset.\n"
         "    Formato hex  : 0x41306141  |  \\x41\\x61\\x30\\x41  |  41306141\n"
         "    Formato ASCII: Aa0A   (los caracteres visibles en el patrón)\n\n"
@@ -530,14 +620,17 @@ static void printHelp() {
 
         "Patterns:\n"
         "  Hex bytes     : FF E4  |  FFE4  |  \\xFF\\xE4  |  0xFF 0xE4\n"
+        "  Wildcards     : FF ?? C3  |  ?? ?? C3   (?? = any byte)\n"
         "  Mnemonics     : jmp esp, call eax, pop ebx, ret, nop ...\n"
         "  Gadgets       : \"push esp; ret\"  |  \"jmp esp; ret\"\n"
-        "                  (separator: ';' or '+', always quoted)\n\n"
+        "                  (separator: ';' or '+', always quoted)\n"
+        "  Wildcard regs : \"pop ?; pop ?; ret\"  (pop ? = any pop-reg byte)\n"
+        "                  \"pop *; pop *; ret\"  (same, alternate syntax)\n\n"
 
         "Examples:\n"
-        "  erc++ --Pattern, c, 1000\n"
-        "  erc++ --Pattern, o, 0xAABBCCDD\n"
-        "  erc++ --Pattern, o, Aa0A\n"
+        "  erc++ -Pattern, c, 1000\n"
+        "  erc++ -Pattern, o, 0xAABBCCDD\n"
+        "  erc++ -Pattern, o, Aa0A\n"
         "  erc++ -SearchMemory, \"jmp esp\"\n"
         "  erc++ -SearchMemory, \"FF E4\", -ASLR\n"
         "  erc++ -SearchMemory, \"FF E4\", -ASLR, -DEP\n"
@@ -546,6 +639,9 @@ static void printHelp() {
         "  erc++ -SearchMemory, \"push esp; ret\"\n"
         "  erc++ -SearchMemory, \"push esp; ret\", -ASLR\n"
         "  erc++ -SearchMemory, \"54 C3\"\n"
+        "  erc++ -SearchMemory, \"FF ?? C3\"\n"
+        "  erc++ -SearchMemory, \"pop ?; pop ?; ret\"\n"
+        "  erc++ -SearchMemory, \"pop ?; pop ?; ret\", -ASLR\n"
     );
 }
 
@@ -631,13 +727,17 @@ static std::string fmtAddr(duint addr) {
 
 // ─── core search ─────────────────────────────────────────────────────────────
 static void doSearch(const SearchArgs& sa, bool modulesOnly) {
-    std::vector<uint8_t> pat;
+    std::vector<PatternByte> pat;
     if (!resolvePattern(sa.pattern, pat)) return;
 
     std::string patHex;
-    for (auto b : pat) {
-        char buf[4]; sprintf_s(buf, "%02X ", b);
-        patHex += buf;
+    for (auto& pb : pat) {
+        if (pb.wildcard) {
+            patHex += "?? ";
+        } else {
+            char buf[4]; sprintf_s(buf, "%02X ", pb.value);
+            patHex += buf;
+        }
     }
 
     std::string filterDesc;
@@ -812,4 +912,3 @@ extern "C" __declspec(dllexport) void plugsetup(PLUG_SETUPSTRUCT* setupStruct) {
     _plugin_registercommand(g_pluginHandle, "erc++", cbCommand, false);
     log("loaded. Type 'erc++ -help' to get started.");
 }
-
