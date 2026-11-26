@@ -98,6 +98,69 @@ static const std::unordered_map<std::string, std::vector<uint8_t>> INSN_MAP = {
 static std::string g_lastPattern;
 static int         g_lastPatternSize = 0;
 
+struct SearchArgs {
+    std::string              pattern;
+    bool                     filterASLR    = false;
+    bool                     filterSafeSEH = false;
+    bool                     filterDEP     = false;
+    bool                     filterRebase  = false;
+    std::vector<std::string> modules;
+    std::vector<uint8_t>     badChars;     // ← nuevo
+    bool                     valid         = false;
+};
+
+// ─── get loaded modules ───────────────────────────────────────────────────────
+struct ModInfo {
+    duint       base;
+    duint       size;
+    std::string name;
+    std::string path;
+};
+
+// ─── Wildcard match (glob): soporta '*' y '?' ────────────────────────────────
+// '*' = cero o más caracteres
+// '?' = exactamente un carácter
+// Ambos argumentos deben venir ya en lowercase.
+static bool wildcardMatch(const char* pat, const char* str) {
+    const char* star   = nullptr;   // último '*' visto en el patrón
+    const char* mark   = nullptr;   // posición en 'str' cuando vimos ese '*'
+    while (*str) {
+        if (*pat == '?' || *pat == *str) {
+            ++pat; ++str;
+        } else if (*pat == '*') {
+            star = pat++;
+            mark = str;
+        } else if (star) {
+            pat = star + 1;
+            str = ++mark;
+        } else {
+            return false;
+        }
+    }
+    while (*pat == '*') ++pat;
+    return *pat == '\0';
+}
+
+
+// ─── ¿el módulo matchea con un patrón de -Modules? ───────────────────────────
+static bool matchModulePattern(const ModInfo& mod, const std::string& pattern) {
+    bool hasWild = pattern.find('*') != std::string::npos ||
+                   pattern.find('?') != std::string::npos;
+
+    if (hasWild) {
+        // Wildcard contra el nombre (lowercased) …
+        if (wildcardMatch(pattern.c_str(), mod.name.c_str())) return true;
+        // … y también contra la ruta completa (lowercased on-the-fly)
+        std::string pathLo = toLower(mod.path);
+        return wildcardMatch(pattern.c_str(), pathLo.c_str());
+    }
+
+    // Sin wildcards: comportamiento original
+    if (mod.name == pattern) return true;
+    std::string pathLo = toLower(mod.path);
+    return pathLo.find(pattern) != std::string::npos;
+}
+
 static std::string generatePattern(int size) {
     const char sets[3][40] = {
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
@@ -367,7 +430,7 @@ static void splitInstruction(const std::string& insn,
 // ─── validación de gadget instrucción por instrucción ────────────────────────
 // Desensambla EXACTAMENTE parts.size() instrucciones desde address.
 // Cada una debe coincidir con su GadgetPart. Ni una instrucción extra.
-static bool validateGadget(duint address, const std::vector<GadgetPart>& parts) {
+static bool validateGadget(duint address, const std::vector<GadgetPart>& parts, size_t* outLen = nullptr) {
     duint cursor = address;
 
     for (size_t i = 0; i < parts.size(); ++i) {
@@ -422,6 +485,7 @@ static bool validateGadget(duint address, const std::vector<GadgetPart>& parts) 
         cursor += info.size;
     }
 
+    if (outLen) *outLen = (size_t)(cursor - address); 
     return true;
 }
 
@@ -652,13 +716,16 @@ static std::vector<duint> searchInBuffer(
     return hits;
 }
 
-// ─── get loaded modules ───────────────────────────────────────────────────────
-struct ModInfo {
-    duint       base;
-    duint       size;
-    std::string name;
-    std::string path;
-};
+// ─── Badchars detection ───────────────────────────────────────────────────
+static bool containsBadChars(const uint8_t* buf, size_t len,
+                             const std::vector<uint8_t>& bad)
+{
+    if (bad.empty()) return false;
+    for (size_t i = 0; i < len; ++i)
+        if (std::find(bad.begin(), bad.end(), buf[i]) != bad.end())
+            return true;
+    return false;
+}
 
 static std::vector<ModInfo> getLoadedModules() {
     std::vector<ModInfo> mods;
@@ -704,11 +771,16 @@ static void printHelp() {
         "      -SafeSEH  exclude SafeSEH-enabled modules\n"
         "      -DEP      exclude DEP/NXCompat-enabled modules\n"
         "      -Rebase   exclude Rebase-enabled modules\n\n"
+        "      -b        exclude hits containing bad characters\n"
+        "                (default: 00 0A 0D 1A if no list given)\n"
+        "      -b, <hex> custom badchar list, e.g. \"00 0A 0D 1A\"\n"
+        "                or \"\\x00\\x0A\\x0D\\x1A\"\n\n"
         "  erc++ -SearchModules, <pattern>, -Modules, <list>[, <flag>...]\n"
-        "    Same as SearchMemory but restricted to specific modules.\n\n"
-        "  erc++ -Pattern, c, <length>\n"
+        "    Same as SearchMemory but restricted to specific modules.\n"
+        "    <list> accepts wildcards: 'ep*.dll', '*user*', 'nt?ll.dll'\n\n"
+        "  erc++ --Pattern, c, <length>\n"
         "    Generate a unique cyclic pattern (ASCII + hex).\n\n"
-        "  erc++ -Pattern, o, <value>\n"
+        "  erc++ --Pattern, o, <value>\n"
         "    Find offset of <value> in the last generated pattern.\n\n"
         "  erc++ -help\n"
         "    Show this message.\n\n"
@@ -725,27 +797,21 @@ static void printHelp() {
         "  add ?         matches any add instruction (any operands)\n"
         "  add eax, ?    matches add eax with any source operand\n\n"
         "Examples:\n"
-        "  erc++ -Pattern, c, 1000\n"
-        "  erc++ -Pattern, o, 0xAABBCCDD\n"
+        "  erc++ --Pattern, c, 1000\n"
+        "  erc++ --Pattern, o, 0xAABBCCDD\n"
         "  erc++ -SearchMemory, \"jmp esp\"\n"
         "  erc++ -SearchMemory, \"FF E4\", -ASLR\n"
         "  erc++ -SearchMemory, \"pop ?; pop ?; ret\"\n"
         "  erc++ -SearchMemory, \"pop ?; add ?; ret\", -ASLR\n"
         "  erc++ -SearchMemory, \"pop ?; add eax, ?; ret\"\n"
         "  erc++ -SearchModules, \"jmp esp\", -Modules, \"kernel32.dll,user32.dll\"\n"
+        "  erc++ -SearchModules, \"jmp esp\", -Modules, \"ep*.dll\"\n"
+        "  erc++ -SearchModules, \"pop ?; pop ?; ret\", -Modules, \"*user*\"\n"
+        "  erc++ -SearchMemory, \"pop ?; pop ?; ret\", -b\n"
+        "  erc++ -SearchMemory, \"pop ?; pop ?; ret\", -b, \"00 0A 0D 1A\", -ASLR\n"
     );
 }
 
-// ─── search args ──────────────────────────────────────────────────────────────
-struct SearchArgs {
-    std::string              pattern;
-    bool                     filterASLR    = false;
-    bool                     filterSafeSEH = false;
-    bool                     filterDEP     = false;
-    bool                     filterRebase  = false;
-    std::vector<std::string> modules;
-    bool                     valid         = false;
-};
 
 static SearchArgs parseArgv(int argc, char* argv[], int start) {
     SearchArgs sa;
@@ -783,9 +849,39 @@ static SearchArgs parseArgv(int argc, char* argv[], int start) {
             }
             std::istringstream mss(modList);
             std::string m;
-            while (std::getline(mss, m, ','))
+            while (std::getline(mss, m, ',')) {
+                // x64dbg solo elimina comillas dobles; los usuarios escriben
+                // a veces 'mod.dll' con comillas simples. Las limpiamos aquí.
+                size_t a = m.find_first_not_of(" \t'\"");
+                size_t b = m.find_last_not_of(" \t'\"");
+                if (a == std::string::npos) continue;
+                m = m.substr(a, b - a + 1);
                 if (!m.empty()) sa.modules.push_back(toLower(m));
-        } else {
+            }
+        } 
+        else if (lo == "-b" || lo == "-badchars") {
+            std::vector<uint8_t> badBytes;
+            if (i + 1 < argc) {
+                std::string next(argv[i + 1]);
+                // Strip quotes (single or double)
+                size_t a = next.find_first_not_of(" \t'\"");
+                size_t b = next.find_last_not_of(" \t'\"");
+                if (a != std::string::npos)
+                    next = next.substr(a, b - a + 1);
+
+                if (!next.empty() && next[0] != '-') {
+                    ++i;
+                    if (!hexToBytes(next, badBytes)) {
+                        logErr("-b invalid byte list: " + next);
+                        return sa;
+                    }
+                }
+            }
+            if (badBytes.empty())
+                badBytes = { 0x00, 0x0A, 0x0D, 0x1A };
+            sa.badChars = badBytes;
+        }
+	else {
             logErr("Unknown flag '" + std::string(argv[i]) + "'. Try erc++ -help.");
             return sa;
         }
@@ -837,6 +933,14 @@ static void doSearch(const SearchArgs& sa, bool modulesOnly) {
     if (sa.filterRebase)  filterDesc += " -Rebase";
     if (filterDesc.empty()) filterDesc = " (no filters)";
 
+    if (!sa.badChars.empty()) {
+        std::string bstr;
+        for (uint8_t b : sa.badChars) {
+            char bb[4]; sprintf_s(bb, "%02X ", b); bstr += bb;
+        }
+        _plugin_logprintf("[erc++] BadChars: %s\n", bstr.c_str());
+    }
+
     _plugin_logprintf("[erc++] Searching for: %s [%s]%s\n",
         sa.pattern.c_str(), patHex.c_str(), filterDesc.c_str());
 
@@ -857,10 +961,9 @@ static void doSearch(const SearchArgs& sa, bool modulesOnly) {
         // Filter by module list if specified
         if (!sa.modules.empty()) {
             bool found = false;
-            for (auto& wantedMod : sa.modules)
-                if (mod.name == wantedMod ||
-                    mod.path.find(wantedMod) != std::string::npos)
-                    { found = true; break; }
+            for (auto& wantedMod : sa.modules) {
+                if (matchModulePattern(mod, wantedMod)) { found = true; break; }
+            }
             if (!found) continue;
         }
 
@@ -881,13 +984,26 @@ static void doSearch(const SearchArgs& sa, bool modulesOnly) {
         // Fast byte-level scan
         auto hits = searchInBuffer(buf.data(), bytesRead, mod.base, pat);
 
-        // Gadget validation: disassemble and verify exact instruction sequence
+        // Validación gadget + badchars
         std::vector<duint> validHits;
         for (duint addr : hits) {
+            size_t matchLen = 0;
+
             if (!gadgetParts.empty()) {
-                if (!validateGadget(addr, gadgetParts))
+                if (!validateGadget(addr, gadgetParts, &matchLen))
+                    continue;
+            } else {
+                matchLen = pat.size();
+            }
+
+            // Comprobación de badchars sobre los bytes reales
+            if (!sa.badChars.empty()) {
+                size_t off = (size_t)(addr - mod.base);
+                if (off + matchLen > bytesRead) continue;
+                if (containsBadChars(buf.data() + off, matchLen, sa.badChars))
                     continue;
             }
+
             validHits.push_back(addr);
         }
 
