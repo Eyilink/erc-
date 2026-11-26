@@ -107,6 +107,7 @@ struct SearchArgs {
     std::vector<std::string> modules;
     std::vector<uint8_t>     badChars;     // ← nuevo
     bool                     valid         = false;
+    std::vector<std::string> permFilters;   // ← nuevo: "R--", "RW-", etc.
 };
 
 // ─── get loaded modules ───────────────────────────────────────────────────────
@@ -116,6 +117,25 @@ struct ModInfo {
     std::string name;
     std::string path;
 };
+
+// ─── Parse permission spec "rw", "R-X", "x", etc. → "RW-", "R-X", "--X" ─────
+static bool parsePermSpec(const std::string& raw, std::string& outSpec) {
+    bool r = false, w = false, x = false, any = false;
+    for (char c : raw) {
+        char u = (char)toupper((unsigned char)c);
+        if      (u == 'R') { r = true; any = true; }
+        else if (u == 'W') { w = true; any = true; }
+        else if (u == 'X') { x = true; any = true; }
+        else if (u == '-' || u == ' ' || u == '\t') continue;
+        else return false;
+    }
+    if (!any) return false;
+    outSpec.clear();
+    outSpec += r ? 'R' : '-';
+    outSpec += w ? 'W' : '-';
+    outSpec += x ? 'X' : '-';
+    return true;
+}
 
 // ─── Wildcard match (glob): soporta '*' y '?' ────────────────────────────────
 // '*' = cero o más caracteres
@@ -775,6 +795,8 @@ static void printHelp() {
         "                (default: 00 0A 0D 1A if no list given)\n"
         "      -b, <hex> custom badchar list, e.g. \"00 0A 0D 1A\"\n"
         "                or \"\\x00\\x0A\\x0D\\x1A\"\n\n"
+        "      -RWX      filtrar las paginas por permissiones\n"
+        "      Combine with OR:  -RX -RWX  →  (R-X) or (RWX)\n\n"
         "  erc++ -SearchModules, <pattern>, -Modules, <list>[, <flag>...]\n"
         "    Same as SearchMemory but restricted to specific modules.\n"
         "    <list> accepts wildcards: 'ep*.dll', '*user*', 'nt?ll.dll'\n\n"
@@ -882,8 +904,17 @@ static SearchArgs parseArgv(int argc, char* argv[], int start) {
             sa.badChars = badBytes;
         }
 	else {
-            logErr("Unknown flag '" + std::string(argv[i]) + "'. Try erc++ -help.");
-            return sa;
+            // Intentar parsear como filtro de permisos: -R, -RW, -RX, -RWX, -X, -W, ...
+            std::string permSpec;
+            bool isPerm = false;
+            if (lo.size() >= 2 && lo[0] == '-') {
+                isPerm = parsePermSpec(lo.substr(1), permSpec);
+            }
+            if (!isPerm) {
+                logErr("Unknown flag '" + std::string(argv[i]) + "'. Try erc++ -help.");
+                return sa;
+            }
+            sa.permFilters.push_back(permSpec);
         }
     }
     sa.valid = true;
@@ -931,6 +962,18 @@ static void doSearch(const SearchArgs& sa, bool modulesOnly) {
     if (sa.filterSafeSEH) filterDesc += " -SafeSEH";
     if (sa.filterDEP)     filterDesc += " -DEP";
     if (sa.filterRebase)  filterDesc += " -Rebase";
+    if (!sa.permFilters.empty()) {
+        std::string disp;
+        for (size_t i = 0; i < sa.permFilters.size(); ++i) {
+            if (i > 0) disp += ",";
+            std::string d = sa.permFilters[i];
+            while (!d.empty() && d.front() == '-') d.erase(0, 1);
+            while (!d.empty() && d.back()  == '-') d.pop_back();
+            if (d.empty()) d = "---";
+            disp += d;
+        }
+        filterDesc += " -Perms[" + disp + "]";
+    }
     if (filterDesc.empty()) filterDesc = " (no filters)";
 
     if (!sa.badChars.empty()) {
@@ -984,11 +1027,17 @@ static void doSearch(const SearchArgs& sa, bool modulesOnly) {
         // Fast byte-level scan
         auto hits = searchInBuffer(buf.data(), bytesRead, mod.base, pat);
 
-        // Validación gadget + badchars
-        std::vector<duint> validHits;
+        // Estructura local para no llamar dos veces a getPagePermissions
+        struct ValidHit {
+            duint       addr;
+            std::string perms;
+        };
+        std::vector<ValidHit> validHits;
+
         for (duint addr : hits) {
             size_t matchLen = 0;
 
+            // 1) validación gadget
             if (!gadgetParts.empty()) {
                 if (!validateGadget(addr, gadgetParts, &matchLen))
                     continue;
@@ -996,7 +1045,7 @@ static void doSearch(const SearchArgs& sa, bool modulesOnly) {
                 matchLen = pat.size();
             }
 
-            // Comprobación de badchars sobre los bytes reales
+            // 2) badchars (barato)
             if (!sa.badChars.empty()) {
                 size_t off = (size_t)(addr - mod.base);
                 if (off + matchLen > bytesRead) continue;
@@ -1004,7 +1053,17 @@ static void doSearch(const SearchArgs& sa, bool modulesOnly) {
                     continue;
             }
 
-            validHits.push_back(addr);
+            // 3) permisos de memoria (syscall) — solo si hay filtro
+            std::string perms = getPagePermissions(addr);
+            if (!sa.permFilters.empty()) {
+                bool match = false;
+                for (auto& p : sa.permFilters) {
+                    if (perms == p) { match = true; break; }
+                }
+                if (!match) continue;
+            }
+
+            validHits.push_back({ addr, perms });
         }
 
         if (!validHits.empty()) {
@@ -1012,10 +1071,9 @@ static void doSearch(const SearchArgs& sa, bool modulesOnly) {
             _plugin_logprintf("[erc++]    ASLR:%-4s SafeSEH:%-4s DEP:%-4s Rebase:%-4s\n",
                 flags.aslr?"yes":"no", flags.safeseh?"yes":"no",
                 flags.dep?"yes":"no",  flags.rebase?"yes":"no");
-            for (duint a : validHits) {
-                std::string perms = getPagePermissions(a);
+            for (auto& h : validHits) {
                 _plugin_logprintf("[erc++]    %s  %s  [%s]\n",
-                    fmtAddr(a).c_str(), mod.name.c_str(), perms.c_str());
+                    fmtAddr(h.addr).c_str(), mod.name.c_str(), h.perms.c_str());
                 ++totalHits;
             }
         }
