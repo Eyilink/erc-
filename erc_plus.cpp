@@ -17,6 +17,7 @@
 #include "pluginsdk/_scriptapi_module.h"
 #include "pluginsdk/_scriptapi_memory.h"
 #include "pluginsdk/_scriptapi_misc.h"
+#include "pluginsdk/bridgemain.h"
 
 #include <windows.h>
 #include <psapi.h>
@@ -117,6 +118,180 @@ struct ModInfo {
     std::string name;
     std::string path;
 };
+
+
+// ─── Obtener un registro vía DbgValFromString ───────────────────────────────
+static duint getRegisterValue(const char* regName) {
+    // DbgValFromString evalúa una expresión del depurador y devuelve duint.
+    // Acepta nombres de registro en minúsculas ("eax", "esp", "eip", …)
+    // y también los alias architecture-independent ("cax", "csp", "cip", …).
+    return DbgValFromString(regName);
+}
+
+// ─── findOffsetOfDword (sin cambios) ────────────────────────────────────────
+static int findOffsetOfDword(duint dwordValue) {
+    if (g_lastPattern.size() < 4) return -1;
+    uint8_t b[4] = {
+        (uint8_t)(dwordValue & 0xFF),
+        (uint8_t)((dwordValue >> 8) & 0xFF),
+        (uint8_t)((dwordValue >> 16) & 0xFF),
+        (uint8_t)((dwordValue >> 24) & 0xFF)
+    };
+    for (size_t i = 0; i <= g_lastPattern.size() - 4; ++i)
+        if ((uint8_t)g_lastPattern[i]     == b[0] &&
+            (uint8_t)g_lastPattern[i + 1] == b[1] &&
+            (uint8_t)g_lastPattern[i + 2] == b[2] &&
+            (uint8_t)g_lastPattern[i + 3] == b[3])
+            return (int)i;
+    return -1;
+}
+
+// ★ NUEVO: devuelve qué offset del PATRÓN corresponde a la memoria en 'addr'
+// (no "dónde empieza el patrón en el buffer", sino "qué trozo del patrón hay aquí")
+static int findPatternOffsetAt(duint addr, size_t probe = 16) {
+    if (g_lastPattern.size() < probe) return -1;
+    std::vector<uint8_t> buf(probe);
+    SIZE_T got = 0;
+    if (!ReadProcessMemory(DbgGetProcessHandle(), (LPCVOID)addr,
+                           buf.data(), probe, &got) || got < probe)
+        return -1;
+    for (size_t off = 0; off + probe <= g_lastPattern.size(); ++off)
+        if (memcmp(buf.data(), g_lastPattern.data() + off, probe) == 0)
+            return (int)off;
+    return -1;
+}
+
+// ★ REESCRITA: clasifica el crash
+static void doAnalyze(const std::vector<uint8_t>& badChars) {
+    if (g_lastPattern.empty()) {
+        logErr("No hay patrón. Ejecuta 'erc++ --Pattern, c, <tamaño>' primero.");
+        return;
+    }
+
+    _plugin_logprintf("[erc++] === Crash Analysis (patrón %zu bytes) ===\n",
+                      g_lastPattern.size());
+
+    // ── 1) Volcar registros con su rol en el patrón ─────────────────────────
+    const char* regs[] = {"EAX","EBX","ECX","EDX","ESI","EDI","EBP","ESP","EIP"};
+    struct RegInfo { const char* name; duint val; int inOffset; int toOffset; };
+    std::vector<RegInfo> info;
+
+    for (auto rn : regs) {
+        RegInfo ri{ rn, getRegisterValue(rn), -1, -1 };
+        ri.inOffset = findOffsetOfDword(ri.val);       // contiene patrón?
+        if (ri.inOffset < 0 && ri.val != 0)
+            ri.toOffset = findPatternOffsetAt(ri.val); // apunta al patrón?
+        info.push_back(ri);
+
+        if (ri.inOffset >= 0)
+            _plugin_logprintf("[erc++]   %s = 0x%p  contains pattern @ offset %d\n",
+                              rn, (void*)ri.val, ri.inOffset);
+        else if (ri.toOffset >= 0)
+            _plugin_logprintf("[erc++]   %s = 0x%p  points to pattern @ offset %d\n",
+                              rn, (void*)ri.val, ri.toOffset);
+        else
+            _plugin_logprintf("[erc++]   %s = 0x%p\n", rn, (void*)ri.val);
+    }
+
+    // ── 2) Localizar EIP y ESP en la tabla ──────────────────────────────────
+    RegInfo* eip = nullptr;
+    RegInfo* esp = nullptr;
+    for (auto& r : info) {
+        if (strcmp(r.name, "EIP") == 0) eip = &r;
+        if (strcmp(r.name, "ESP") == 0) esp = &r;
+    }
+
+    // ── 3) ★ CLASIFICACIÓN ──────────────────────────────────────────────────
+    _plugin_logprintf("[erc++] \n");
+
+    int  eipOff = eip ? eip->inOffset  : -1;   // EIP contiene patrón
+    int  espOff = esp ? esp->toOffset  : -1;   // ESP apunta al patrón
+    std::string explType;
+
+    if (eipOff >= 0) {
+        // ── Caso A: EIP está directamente sobrescrito con patrón ───────────
+        if (espOff >= 0 && espOff == eipOff + 4) {
+            // Caso A1: ESP apunta exactamente al byte justo después de EIP
+            explType = "direct ret overwrite (stack pivot to ESP)";
+            _plugin_logprintf("[erc++] type of exploit: %s (offset %d)\n",
+                              explType.c_str(), eipOff);
+            _plugin_logprintf("[erc++] ESP @ offset %d  ==  EIP_off + 4  → 'jmp esp' viable\n",
+                              espOff);
+        }
+        else if (espOff >= 0) {
+            // Caso A2: EIP sobrescrito, pero ESP apunta a otra zona del patrón
+            explType = "direct ret overwrite (frame offset mismatch)";
+            _plugin_logprintf("[erc++] type of exploit: %s (offset %d)\n",
+                              explType.c_str(), eipOff);
+            _plugin_logprintf("[erc++] ESP @ offset %d  !=  EIP_off + 4 (%d)\n",
+                              espOff, eipOff + 4);
+        }
+        else {
+            // Caso A3: EIP sobrescrito pero ESP no apunta al patrón
+            explType = "direct ret overwrite (EIP only)";
+            _plugin_logprintf("[erc++] type of exploit: %s (offset %d)\n",
+                              explType.c_str(), eipOff);
+
+            // Buscar pivots alternativos
+            for (auto& r : info) {
+                if (strcmp(r.name, "ESP") == 0) continue;
+                if (r.toOffset >= 0) {
+                    _plugin_logprintf("[erc++]   pivot candidate: %s @ offset %d\n",
+                                      r.name, r.toOffset);
+                }
+            }
+        }
+    }
+    else {
+        // ── Caso B: EIP NO es patrón → posible SEH overwrite ───────────────
+        // En SEH, tras la excepción, [ESP] = nSEH y [ESP+4] = SEH handler
+        int nsehOff = esp ? findPatternOffsetAt(esp->val)     : -1;
+        int sehOff  = esp ? findPatternOffsetAt(esp->val + 4) : -1;
+
+        if (nsehOff >= 0 || sehOff >= 0) {
+            explType = "SEH overwrite";
+            _plugin_logprintf("[erc++] type of exploit: %s (nSEH off %d, SEH off %d)\n",
+                              explType.c_str(), nsehOff, sehOff);
+        } else {
+            explType = "unknown (EIP not pattern, SEH not pattern)";
+            _plugin_logprintf("[erc++] type of exploit: %s\n", explType.c_str());
+        }
+    }
+
+    // ── 4) ★ Esqueleto Python, ahora con el offset correcto ─────────────────
+    if (eipOff >= 0) {
+        std::string badchars = "b'";
+        if (badChars.empty()) badchars += "\\x00\\x0A\\x0D\\x1A";
+        else for (uint8_t b : badChars) {
+            char t[8]; sprintf_s(t, "\\x%02X", b); badchars += t;
+        }
+        badchars += "'";
+
+        _plugin_logprintf("[erc++] \n");
+        _plugin_logprintf("[erc++] Suggested Python exploit skeleton:\n");
+        _plugin_logprintf("[erc++] -------------------------------------------------\n");
+        _plugin_logprintf("[erc++] #!/usr/bin/env python3\n");
+        _plugin_logprintf("[erc++] from struct import pack\n");
+        _plugin_logprintf("[erc++] \n");
+        _plugin_logprintf("[erc++] badchars = %s\n", badchars.c_str());
+        _plugin_logprintf("[erc++] offset   = %d            # EIP offset\n", eipOff);
+        _plugin_logprintf("[erc++] \n");
+        _plugin_logprintf("[erc++] # Find a usable jump with:\n");
+        _plugin_logprintf("[erc++] #   erc++ -SearchMemory, \"jmp esp\", -ASLR, -RX, -b\n");
+        _plugin_logprintf("[erc++] jmp_esp  = 0xDEADBEEF  # ← replace\n");
+        _plugin_logprintf("[erc++] \n");
+        _plugin_logprintf("[erc++] shellcode = b\"\"       # ← your shellcode\n");
+        _plugin_logprintf("[erc++] \n");
+        _plugin_logprintf("[erc++] payload  = b'A' * offset\n");
+        _plugin_logprintf("[erc++] payload += pack('<I', jmp_esp)\n");
+        _plugin_logprintf("[erc++] payload += shellcode\n");
+        _plugin_logprintf("[erc++] \n");
+        _plugin_logprintf("[erc++] # send(payload) ...\n");
+        _plugin_logprintf("[erc++] -------------------------------------------------\n");
+    }
+
+    _plugin_logprintf("[erc++] === End Analysis ===\n");
+}
 
 // ─── Parse permission spec "rw", "R-X", "x", etc. → "RW-", "R-X", "--X" ─────
 static bool parsePermSpec(const std::string& raw, std::string& outSpec) {
@@ -831,6 +1006,9 @@ static void printHelp() {
         "  erc++ -SearchModules, \"pop ?; pop ?; ret\", -Modules, \"*user*\"\n"
         "  erc++ -SearchMemory, \"pop ?; pop ?; ret\", -b\n"
         "  erc++ -SearchMemory, \"pop ?; pop ?; ret\", -b, \"00 0A 0D 1A\", -ASLR\n"
+	"  erc++ --Pattern, c, 1000\n"
+	"  erc++ -analyze\n"
+	"  erc++ -analyze, -b, \"00 0A\"\n"
     );
 }
 
@@ -1167,6 +1345,31 @@ static bool cbCommand(int argc, char* argv[]) {
             return true;
         }
         doPatternCommand(std::vector<std::string>(tokens.begin() + 1, tokens.end()));
+        return true;
+    }
+
+    if (subcmd == "-analyze" || subcmd == "--analyze") {
+        std::vector<uint8_t> badChars = { 0x00, 0x0A, 0x0D, 0x1A };
+
+        // Args opcionales tras -analyze (sólo -b por ahora)
+        for (size_t k = 1; k < tokens.size(); ++k) {
+            std::string lo = toLower(tokens[k]);
+            if (lo == "-b" || lo == "-badchars") {
+                if (k + 1 < tokens.size()) {
+                    std::string next = tokens[k + 1];
+                    size_t a = next.find_first_not_of(" \t'\"");
+                    size_t b = next.find_last_not_of(" \t'\"");
+                    if (a != std::string::npos) next = next.substr(a, b - a + 1);
+                    if (!next.empty() && next[0] != '-') {
+                        ++k;
+                        std::vector<uint8_t> custom;
+                        if (hexToBytes(next, custom)) badChars = custom;
+                    }
+                }
+            }
+        }
+
+        doAnalyze(badChars);
         return true;
     }
 
